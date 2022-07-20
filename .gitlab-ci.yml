@@ -1,0 +1,140 @@
+workflow:
+   rules:
+     - if: $CI_COMMIT_BRANCH != "main" && $CI_PIPELINE_SOURCE != "merge_request_event"
+       when: never
+     - when: always
+
+stages:
+  - test
+  - build
+  - deploy_to_dev
+  - deploy_to_staging
+  - deploy_to_prod
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/microservice
+  DEV_ENV: http://172.16.8.19:3000
+  STAGING_ENV: http://172.16.8.15:3000
+  PROD_ENV: http://172.16.8.21:3000
+  DEV_SERVER_HOST: 172.16.8.19
+  STAG_SERVER_HOST: 172.16.8.15
+  PROD_SERVER_HOST: 172.16.8.21
+
+test_process:
+  stage: test 
+  image: node:17-alpine3.14
+  tags:
+    - docker
+  before_script:
+    - cd app
+    - npm install
+  script:
+    - npm test
+
+build_image:
+  stage: build
+  only:
+    - main
+  tags:
+    - shell
+  before_script:
+    - export PACKAGE_VERSION=$(cat app/package.json | jq -r .version)
+    - export TAG_VERSION=$PACKAGE_VERSION.$CI_PIPELINE_IID
+    - echo "TAG_VERSION=$TAG_VERSION" >> file.env
+  script:
+    - docker build . -t $IMAGE_NAME:$TAG_VERSION
+  artifacts:
+    reports:
+      dotenv: file.env
+  
+ 
+
+push_gitlab_registry:
+  stage: build
+  only:
+    - main 
+  tags:
+    - shell
+  needs:
+    - build_image
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker push $IMAGE_NAME:$TAG_VERSION  
+
+.deploy_template:
+  tags:
+    - shell
+  variables:
+    SERVER_HOST: ""
+    DEPLOY_ENV: ""
+    ENDPOINT: ""
+  before_script:
+    - echo "$SSH_PRIVATE_KEY" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - scp -o StrictHostKeyChecking=no ./docker-compose.yml aslan@$SERVER_HOST:/home/aslan
+  script:
+    - ssh -o StrictHostKeyChecking=no aslan@$SERVER_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        export COMPOSE_PROJECT_NAME=$DEPLOY_ENV
+        export DOCKER_IMAGE_NAME=$IMAGE_NAME &&
+        export DOCKER_IMAGE_TAG=$TAG_VERSION &&
+        docker-compose down &&
+        docker-compose up -d"
+        
+  environment:
+    name: $DEPLOY_ENV #here we can write everything we write here compose_project_name
+    url: $ENDPOINT
+
+
+
+deploy_dev:
+  extends: .deploy_template
+  stage: deploy_to_dev
+  variables:
+    SERVER_HOST: $DEV_SERVER_HOST
+    DEPLOY_ENV: development
+    ENDPOINT: $DEV_ENV
+
+
+run_functional_test_for_dev:
+  stage: deploy_to_dev
+  tags:
+    - shell
+  needs:
+    - deploy_dev
+  script:
+    - echo "running fucntional test for development environment"       #after deploy to dev run functional test for dev without paralel working needs write  if failed don't deploy in staging environment
+
+deploy_staging:
+  extends: .deploy_template
+  stage: deploy_to_staging
+  variables:
+    SERVER_HOST: $STAG_SERVER_HOST
+    DEPLOY_ENV: staging
+    ENDPOINT: $STAGING_ENV
+
+  environment:
+    name: $DEPLOY_ENV #here we can write everything we write here compose_project_name
+    url: $STAGING_ENV
+  
+run_perfomance_for_staging:
+  stage: deploy_to_staging
+  tags:
+    - shell
+  needs:
+    - deploy_staging
+  script:
+    - echo "running perfomance test for staging env"     #why needs after we deploy in staging we must test perfomance of application in staging env and if everything is successful we can deploy it automatically to PROD it's called Continious Deployment 
+
+deploy_prod:
+  extends: .deploy_template
+  stage: deploy_to_prod
+  variables:
+    SERVER_HOST: $PROD_SERVER_HOST
+    DEPLOY_ENV: prod 
+    ENDPOINT: $PROD_ENV 
+  #when: manual            #when:manual it's mean that after we deploy to staging env it's automaticcally deploy to PROD but with it we must manual click to button if don't click it's doesn't deploy to PROD
+  environment:
+    name: $DEPLOY_ENV
+    url: $PROD_ENV
